@@ -40,7 +40,8 @@ built with Python FastAPI backend and a premium dark-themed dashboard UI.
 | GET | /months | Get available months |
 
 ## Screenshots
-(Add a screenshot of your dashboard here)
+
+
 
 ## Author
 Piyush Jha — [LinkedIn](https://linkedin.com/in/piyushjha2003) | [Portfolio](https://piyush-jha-portfolio-html.vercel.app)
