@@ -2,104 +2,185 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
-import sqlite3
 import csv
 import io
- 
+import os
+
+# â”€â”€ Database: PostgreSQL in production, SQLite locally â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+if DATABASE_URL:
+    # Production: PostgreSQL on Render
+    import psycopg2
+    import psycopg2.extras
+
+    def get_db():
+        conn = psycopg2.connect(DATABASE_URL, sslmode="require")
+        return conn
+
+    def init_db():
+        conn = get_db()
+        conn.cursor().execute("""
+            CREATE TABLE IF NOT EXISTS transactions (
+                id SERIAL PRIMARY KEY,
+                title TEXT NOT NULL,
+                amount REAL NOT NULL,
+                category TEXT NOT NULL,
+                type TEXT NOT NULL,
+                date TEXT NOT NULL
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+    def fetchall_as_dicts(cursor):
+        cols = [desc[0] for desc in cursor.description]
+        return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+    def date_trunc_month(col):
+        return f"TO_CHAR({col}::date, 'YYYY-MM')"
+
+else:
+    # Local dev: SQLite
+    import sqlite3
+
+    DB_PATH = "finance.db"
+
+    def get_db():
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def init_db():
+        conn = get_db()
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                amount REAL NOT NULL,
+                category TEXT NOT NULL,
+                type TEXT NOT NULL,
+                date TEXT NOT NULL
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+    def fetchall_as_dicts(cursor):
+        return [dict(r) for r in cursor.fetchall()]
+
+    def date_trunc_month(col):
+        return f"strftime('%Y-%m', {col})"
+
+
+# â”€â”€ App â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 app = FastAPI()
- 
-def init_db():
-    conn = sqlite3.connect("finance.db")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            amount REAL NOT NULL,
-            category TEXT NOT NULL,
-            type TEXT NOT NULL,
-            date TEXT NOT NULL
-        )
-    """)
-    conn.commit()
-    conn.close()
- 
-def get_db():
-    conn = sqlite3.connect("finance.db")
-    conn.row_factory = sqlite3.Row
-    return conn
- 
+
+@app.on_event("startup")
+def startup():
+    init_db()
+
+
 class Transaction(BaseModel):
     title: str
     amount: float
     category: str
     type: str
     date: str
- 
+
+
 @app.get("/transactions")
 def get_transactions(month: Optional[str] = Query(None)):
     conn = get_db()
+    cur = conn.cursor()
     if month:
-        rows = conn.execute(
-            "SELECT * FROM transactions WHERE strftime('%Y-%m', date) = ? ORDER BY date DESC",
+        cur.execute(
+            f"SELECT * FROM transactions WHERE {date_trunc_month('date')} = %s ORDER BY date DESC"
+            if DATABASE_URL else
+            f"SELECT * FROM transactions WHERE {date_trunc_month('date')} = ? ORDER BY date DESC",
             (month,)
-        ).fetchall()
+        )
     else:
-        rows = conn.execute("SELECT * FROM transactions ORDER BY date DESC").fetchall()
+        cur.execute("SELECT * FROM transactions ORDER BY date DESC")
+    rows = fetchall_as_dicts(cur)
     conn.close()
-    return [dict(r) for r in rows]
- 
+    return rows
+
+
 @app.post("/transactions")
 def add_transaction(t: Transaction):
     conn = get_db()
-    cursor = conn.execute(
-        "INSERT INTO transactions (title, amount, category, type, date) VALUES (?,?,?,?,?)",
-        (t.title, t.amount, t.category, t.type, t.date)
-    )
+    cur = conn.cursor()
+    if DATABASE_URL:
+        cur.execute(
+            "INSERT INTO transactions (title, amount, category, type, date) VALUES (%s,%s,%s,%s,%s) RETURNING id",
+            (t.title, t.amount, t.category, t.type, t.date)
+        )
+        new_id = cur.fetchone()[0]
+    else:
+        cur.execute(
+            "INSERT INTO transactions (title, amount, category, type, date) VALUES (?,?,?,?,?)",
+            (t.title, t.amount, t.category, t.type, t.date)
+        )
+        new_id = cur.lastrowid
     conn.commit()
     conn.close()
-    return {"message": "Added", "id": cursor.lastrowid}
- 
+    return {"message": "Added", "id": new_id}
+
+
 @app.delete("/transactions/{tid}")
 def delete_transaction(tid: int):
     conn = get_db()
-    conn.execute("DELETE FROM transactions WHERE id = ?", (tid,))
+    cur = conn.cursor()
+    placeholder = "%s" if DATABASE_URL else "?"
+    cur.execute(f"DELETE FROM transactions WHERE id = {placeholder}", (tid,))
     conn.commit()
     conn.close()
     return {"message": "Deleted"}
- 
+
+
 @app.get("/summary")
 def get_summary(month: Optional[str] = Query(None)):
     conn = get_db()
+    cur = conn.cursor()
     if month:
-        rows = conn.execute(
-            "SELECT * FROM transactions WHERE strftime('%Y-%m', date) = ?",
+        cur.execute(
+            f"SELECT * FROM transactions WHERE {date_trunc_month('date')} = %s"
+            if DATABASE_URL else
+            f"SELECT * FROM transactions WHERE {date_trunc_month('date')} = ?",
             (month,)
-        ).fetchall()
+        )
     else:
-        rows = conn.execute("SELECT * FROM transactions").fetchall()
+        cur.execute("SELECT * FROM transactions")
+    rows = fetchall_as_dicts(cur)
     conn.close()
     income = sum(r["amount"] for r in rows if r["type"] == "income")
     expense = sum(r["amount"] for r in rows if r["type"] == "expense")
     return {"income": income, "expense": expense, "balance": income - expense}
- 
+
+
 @app.get("/export")
 def export_csv(month: Optional[str] = Query(None)):
     conn = get_db()
+    cur = conn.cursor()
     if month:
-        rows = conn.execute(
-            "SELECT * FROM transactions WHERE strftime('%Y-%m', date) = ? ORDER BY date DESC",
+        cur.execute(
+            f"SELECT * FROM transactions WHERE {date_trunc_month('date')} = %s ORDER BY date DESC"
+            if DATABASE_URL else
+            f"SELECT * FROM transactions WHERE {date_trunc_month('date')} = ? ORDER BY date DESC",
             (month,)
-        ).fetchall()
+        )
     else:
-        rows = conn.execute("SELECT * FROM transactions ORDER BY date DESC").fetchall()
+        cur.execute("SELECT * FROM transactions ORDER BY date DESC")
+    rows = fetchall_as_dicts(cur)
     conn.close()
- 
+
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["ID", "Title", "Amount", "Category", "Type", "Date"])
     for r in rows:
         writer.writerow([r["id"], r["title"], r["amount"], r["category"], r["type"], r["date"]])
- 
+
     output.seek(0)
     filename = f"transactions_{month}.csv" if month else "transactions_all.csv"
     return StreamingResponse(
@@ -107,16 +188,22 @@ def export_csv(month: Optional[str] = Query(None)):
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
- 
+
+
 @app.get("/months")
 def get_months():
     conn = get_db()
-    rows = conn.execute(
-        "SELECT DISTINCT strftime('%Y-%m', date) as month FROM transactions ORDER BY month DESC"
-    ).fetchall()
+    cur = conn.cursor()
+    cur.execute(
+        f"SELECT DISTINCT {date_trunc_month('date')} as month FROM transactions ORDER BY month DESC"
+    )
+    rows = cur.fetchall()
     conn.close()
+    if DATABASE_URL:
+        return [r[0] for r in rows]
     return [r["month"] for r in rows]
- 
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
     return """
@@ -130,7 +217,7 @@ def dashboard():
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: 'Segoe UI', sans-serif; background: #0f0f1a; color: #e0e0e0; min-height: 100vh; }
- 
+
   header {
     background: linear-gradient(135deg, #1a1a2e, #16213e);
     padding: 20px 40px;
@@ -142,7 +229,7 @@ def dashboard():
   header h1 { font-size: 24px; color: #a78bfa; font-weight: 600; letter-spacing: 1px; }
   .header-right { display: flex; align-items: center; gap: 12px; }
   header span { font-size: 13px; color: #666; }
- 
+
   .month-select {
     background: #1a1a2e;
     border: 1px solid #2a2a4a;
@@ -154,7 +241,7 @@ def dashboard():
     cursor: pointer;
   }
   .month-select:focus { border-color: #a78bfa; }
- 
+
   .export-btn {
     background: linear-gradient(135deg, #065f46, #34d399);
     border: none;
@@ -167,9 +254,9 @@ def dashboard():
     transition: opacity 0.2s;
   }
   .export-btn:hover { opacity: 0.85; }
- 
+
   .container { max-width: 1100px; margin: 0 auto; padding: 30px 20px; }
- 
+
   .filter-bar {
     background: #1a1a2e;
     border: 1px solid #2a2a4a;
@@ -195,7 +282,7 @@ def dashboard():
   }
   .filter-pill:hover { border-color: #a78bfa; color: #a78bfa; }
   .filter-pill.active { background: #a78bfa; color: white; border-color: #a78bfa; }
- 
+
   .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; margin-bottom: 30px; }
   .card {
     background: #1a1a2e;
@@ -212,9 +299,9 @@ def dashboard():
   .card.balance .value { color: #a78bfa; }
   .card .icon { font-size: 28px; float: right; margin-top: -10px; }
   .card .sub { font-size: 11px; color: #555; margin-top: 8px; }
- 
+
   .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 30px; }
- 
+
   .panel {
     background: #1a1a2e;
     border-radius: 16px;
@@ -222,7 +309,7 @@ def dashboard():
     border: 1px solid #2a2a4a;
   }
   .panel h2 { font-size: 15px; color: #a78bfa; margin-bottom: 20px; font-weight: 500; }
- 
+
   .form-group { margin-bottom: 14px; }
   .form-group label { font-size: 12px; color: #888; display: block; margin-bottom: 6px; }
   .form-group input, .form-group select {
@@ -237,7 +324,7 @@ def dashboard():
     transition: border 0.2s;
   }
   .form-group input:focus, .form-group select:focus { border-color: #a78bfa; }
- 
+
   .btn {
     width: 100%;
     padding: 12px;
@@ -252,7 +339,7 @@ def dashboard():
     transition: opacity 0.2s;
   }
   .btn:hover { opacity: 0.85; }
- 
+
   .tx-list { max-height: 340px; overflow-y: auto; }
   .tx-item {
     display: flex;
@@ -278,7 +365,7 @@ def dashboard():
     cursor: pointer;
   }
   .tx-delete:hover { color: #ff5555; }
- 
+
   .tag {
     display: inline-block;
     font-size: 10px;
@@ -289,57 +376,64 @@ def dashboard():
   }
   .tag-income { background: #064e3b; color: #34d399; }
   .tag-expense { background: #450a0a; color: #f87171; }
- 
+
   .empty { color: #555; font-size: 13px; text-align: center; padding: 30px 0; }
- 
+
   ::-webkit-scrollbar { width: 4px; }
   ::-webkit-scrollbar-track { background: #1a1a2e; }
   ::-webkit-scrollbar-thumb { background: #3a3a5a; border-radius: 4px; }
+
+  @media (max-width: 768px) {
+    header { padding: 14px 16px; flex-wrap: wrap; gap: 10px; }
+    .cards { grid-template-columns: 1fr; }
+    .grid2 { grid-template-columns: 1fr; }
+    .header-right { flex-wrap: wrap; }
+  }
 </style>
 </head>
 <body>
- 
+
 <header>
-  <h1>💰 Finance Tracker</h1>
+  <h1>ðŸ’° Finance Tracker</h1>
   <div class="header-right">
     <select class="month-select" id="month-filter" onchange="applyMonthFilter()">
       <option value="">All Time</option>
     </select>
-    <button class="export-btn" onclick="exportCSV()">⬇ Export CSV</button>
+    <button class="export-btn" onclick="exportCSV()">â¬‡ Export CSV</button>
     <span id="date-display"></span>
   </div>
 </header>
- 
+
 <div class="container">
- 
+
   <div class="filter-bar">
     <span>Filter:</span>
     <button class="filter-pill active" onclick="setFilter('all', this)">All</button>
     <button class="filter-pill" onclick="setFilter('income', this)">Income only</button>
     <button class="filter-pill" onclick="setFilter('expense', this)">Expenses only</button>
   </div>
- 
+
   <div class="cards">
     <div class="card income">
       <div class="label">Total Income</div>
-      <span class="icon">📈</span>
-      <div class="value" id="total-income">₹0</div>
+      <span class="icon">ðŸ“ˆ</span>
+      <div class="value" id="total-income">â‚¹0</div>
       <div class="sub" id="income-count">0 transactions</div>
     </div>
     <div class="card expense">
       <div class="label">Total Expenses</div>
-      <span class="icon">📉</span>
-      <div class="value" id="total-expense">₹0</div>
+      <span class="icon">ðŸ“‰</span>
+      <div class="value" id="total-expense">â‚¹0</div>
       <div class="sub" id="expense-count">0 transactions</div>
     </div>
     <div class="card balance">
       <div class="label">Net Balance</div>
-      <span class="icon">💎</span>
-      <div class="value" id="net-balance">₹0</div>
-      <div class="sub" id="balance-label">—</div>
+      <span class="icon">ðŸ’Ž</span>
+      <div class="value" id="net-balance">â‚¹0</div>
+      <div class="sub" id="balance-label">â€”</div>
     </div>
   </div>
- 
+
   <div class="grid2">
     <div class="panel">
       <h2>Add Transaction</h2>
@@ -348,7 +442,7 @@ def dashboard():
         <input type="text" id="title" placeholder="e.g. Salary, Rent...">
       </div>
       <div class="form-group">
-        <label>Amount (₹)</label>
+        <label>Amount (â‚¹)</label>
         <input type="number" id="amount" placeholder="0.00">
       </div>
       <div class="form-group">
@@ -377,35 +471,37 @@ def dashboard():
       </div>
       <button class="btn" onclick="addTransaction()">+ Add Transaction</button>
     </div>
- 
+
     <div class="panel">
       <h2>Spending Chart</h2>
       <canvas id="chart" height="260"></canvas>
     </div>
   </div>
- 
+
   <div class="panel">
     <h2>Transactions <span id="tx-count" style="color:#555;font-size:12px;font-weight:400;"></span></h2>
     <div class="tx-list" id="tx-list">
       <p class="empty">No transactions yet.</p>
     </div>
   </div>
- 
+
 </div>
- 
+
 <script>
   const today = new Date();
   document.getElementById("date").valueAsDate = today;
   document.getElementById("date-display").textContent = today.toDateString();
- 
+
   let chart;
   let currentMonth = "";
   let currentFilter = "all";
   let allTransactions = [];
- 
+
   async function loadMonths() {
     const months = await fetch("/months").then(r => r.json());
     const sel = document.getElementById("month-filter");
+    // Clear existing options except "All Time"
+    while (sel.options.length > 1) sel.remove(1);
     months.forEach(m => {
       const opt = document.createElement("option");
       opt.value = m;
@@ -415,55 +511,55 @@ def dashboard():
       sel.appendChild(opt);
     });
   }
- 
+
   async function loadData() {
     const url = currentMonth ? `?month=${currentMonth}` : "";
     const [summary, transactions] = await Promise.all([
       fetch("/summary" + url).then(r => r.json()),
       fetch("/transactions" + url).then(r => r.json())
     ]);
- 
+
     allTransactions = transactions;
- 
-    document.getElementById("total-income").textContent = "₹" + summary.income.toLocaleString();
-    document.getElementById("total-expense").textContent = "₹" + summary.expense.toLocaleString();
-    document.getElementById("net-balance").textContent = "₹" + summary.balance.toLocaleString();
- 
+
+    document.getElementById("total-income").textContent = "â‚¹" + summary.income.toLocaleString();
+    document.getElementById("total-expense").textContent = "â‚¹" + summary.expense.toLocaleString();
+    document.getElementById("net-balance").textContent = "â‚¹" + summary.balance.toLocaleString();
+
     const incomeCount = transactions.filter(t => t.type === "income").length;
     const expenseCount = transactions.filter(t => t.type === "expense").length;
     document.getElementById("income-count").textContent = incomeCount + " transactions";
     document.getElementById("expense-count").textContent = expenseCount + " transactions";
-    document.getElementById("balance-label").textContent = summary.balance >= 0 ? "Positive ✓" : "Negative ✗";
- 
+    document.getElementById("balance-label").textContent = summary.balance >= 0 ? "Positive âœ“" : "Negative âœ—";
+
     applyFilterRender();
     renderChart(transactions);
   }
- 
+
   function applyFilterRender() {
     let filtered = allTransactions;
     if (currentFilter === "income") filtered = allTransactions.filter(t => t.type === "income");
     if (currentFilter === "expense") filtered = allTransactions.filter(t => t.type === "expense");
     renderTransactions(filtered);
-    document.getElementById("tx-count").textContent = "— " + filtered.length + " shown";
+    document.getElementById("tx-count").textContent = "â€” " + filtered.length + " shown";
   }
- 
+
   function setFilter(type, el) {
     currentFilter = type;
     document.querySelectorAll(".filter-pill").forEach(p => p.classList.remove("active"));
     el.classList.add("active");
     applyFilterRender();
   }
- 
+
   function applyMonthFilter() {
     currentMonth = document.getElementById("month-filter").value;
     loadData();
   }
- 
+
   function exportCSV() {
     const url = currentMonth ? `/export?month=${currentMonth}` : "/export";
     window.location.href = url;
   }
- 
+
   function renderTransactions(list) {
     const el = document.getElementById("tx-list");
     if (!list.length) {
@@ -474,17 +570,17 @@ def dashboard():
       <div class="tx-item">
         <div class="tx-left">
           <div class="tx-title">${t.title}</div>
-          <div class="tx-meta">${t.date} &nbsp;•&nbsp; ${t.category}</div>
+          <div class="tx-meta">${t.date} &nbsp;â€¢&nbsp; ${t.category}</div>
           <span class="tag tag-${t.type}">${t.type}</span>
         </div>
         <div class="tx-right">
-          <div class="tx-amount ${t.type}">${t.type === "income" ? "+" : "-"}₹${t.amount.toLocaleString()}</div>
-          <button class="tx-delete" onclick="deleteTransaction(${t.id})">✕ remove</button>
+          <div class="tx-amount ${t.type}">${t.type === "income" ? "+" : "-"}â‚¹${t.amount.toLocaleString()}</div>
+          <button class="tx-delete" onclick="deleteTransaction(${t.id})">âœ• remove</button>
         </div>
       </div>
     `).join("");
   }
- 
+
   function renderChart(transactions) {
     const cats = {};
     transactions.filter(t => t.type === "expense").forEach(t => {
@@ -506,7 +602,7 @@ def dashboard():
       }
     });
   }
- 
+
   async function addTransaction() {
     const title = document.getElementById("title").value.trim();
     const amount = parseFloat(document.getElementById("amount").value);
@@ -524,19 +620,21 @@ def dashboard():
     await loadMonths();
     loadData();
   }
- 
+
   async function deleteTransaction(id) {
     await fetch("/transactions/" + id, { method: "DELETE" });
     loadData();
   }
- 
+
   loadMonths().then(() => loadData());
 </script>
 </body>
 </html>
 """
- 
+
+
 if __name__ == "__main__":
     init_db()
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
