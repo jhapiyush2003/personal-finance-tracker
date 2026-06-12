@@ -33,7 +33,7 @@ Key: DATABASE_URL
 Value: paste the Internal Database URL
 Click Save — Render will redeploy automatically
 Step 6 — Done!
-Your live URL will be: https://personal-finance-tracker-xxxx.onrender.com
+Your live URL will be: https://personal-finance-tracker-2-qnb1.onrender.com/
 
 Note: Free Render services sleep after 15 min of inactivity and take ~30s to wake up. This is fine for a portfolio project.
 
