@@ -44,6 +44,6 @@ Hosting: Render (free tier)
 Run Locally
 pip install -r requirements.txt
 python finance_tracker.py
-# Open http://127.0.0.1:8000
+# Open https://personal-finance-tracker-2-qnb1.onrender.com/
 Author
 Piyush Jha — LinkedIn | Portfolio
